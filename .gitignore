@@ -1,0 +1,33 @@
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+.fvm/
+
+# IDE / Tooling
+.idea/
+.vscode/
+.claude/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dart
+*.lock
+!pubspec.lock
+
+# Coverage
+coverage/
+
+# Generated
+*.g.dart
+*.freezed.dart
+*.config.dart

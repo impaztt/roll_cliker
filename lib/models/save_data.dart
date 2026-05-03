@@ -3,7 +3,7 @@ import 'game_stats.dart';
 import 'stock_market.dart';
 
 class SaveData {
-  static const currentVersion = 1;
+  static const currentVersion = 2;
 
   int version;
   double coin;
@@ -13,6 +13,12 @@ class SaveData {
   Map<String, int> tapUpgradeLevels;
   Map<String, int> autoProducerLevels;
   Map<String, int> prestigeUpgradeLevels;
+
+  // Headline upgrades surfaced on the home screen.
+  // ticket = tap reward, speed = ride cycle speed, cars = seats per ride.
+  int ticketLevel;
+  int speedLevel;
+  int carsLevel;
 
   int parkEssence;
   int prestigePoints;
@@ -53,6 +59,9 @@ class SaveData {
     Map<String, int>? tapUpgradeLevels,
     Map<String, int>? autoProducerLevels,
     Map<String, int>? prestigeUpgradeLevels,
+    this.ticketLevel = 1,
+    this.speedLevel = 1,
+    this.carsLevel = 1,
     this.parkEssence = 50,
     this.prestigePoints = 0,
     this.prestigeCount = 0,
@@ -99,6 +108,9 @@ class SaveData {
         'tapUpgradeLevels': tapUpgradeLevels,
         'autoProducerLevels': autoProducerLevels,
         'prestigeUpgradeLevels': prestigeUpgradeLevels,
+        'ticketLevel': ticketLevel,
+        'speedLevel': speedLevel,
+        'carsLevel': carsLevel,
         'parkEssence': parkEssence,
         'prestigePoints': prestigePoints,
         'prestigeCount': prestigeCount,
@@ -136,6 +148,9 @@ class SaveData {
             Map<String, int>.from(json['autoProducerLevels'] as Map? ?? {}),
         prestigeUpgradeLevels:
             Map<String, int>.from(json['prestigeUpgradeLevels'] as Map? ?? {}),
+        ticketLevel: json['ticketLevel'] as int? ?? 1,
+        speedLevel: json['speedLevel'] as int? ?? 1,
+        carsLevel: json['carsLevel'] as int? ?? 1,
         parkEssence: json['parkEssence'] as int? ?? 50,
         prestigePoints: json['prestigePoints'] as int? ?? 0,
         prestigeCount: json['prestigeCount'] as int? ?? 0,

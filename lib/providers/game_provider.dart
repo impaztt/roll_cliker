@@ -52,6 +52,23 @@ const List<double> coasterStageThresholdsDouble = [
   1e22,
 ];
 
+// ── Headline upgrades ────────────────────────────────────────────────
+// Ticket = per-tap reward multiplier (additive on tap power).
+// Speed  = ride cycle speed (1.0 + level × step).
+// Cars   = seats per ride. baseSeats + carsLevel * extraPerLevel.
+const int ticketMaxLevelInfinite = 0; // 0 = no cap
+const int speedMaxLevel = 50;
+const int carsMaxLevel = 25;
+
+double ticketCost(int level) => 25 * math.pow(1.12, level - 1).toDouble();
+double speedCost(int level) => 200 * math.pow(1.20, level - 1).toDouble();
+double carsCost(int level) => 500 * math.pow(1.25, level - 1).toDouble();
+
+double ticketTapBonus(int level) => 1 + (level - 1) * 1.0; // +1 per level
+double speedScale(int level) => 1.0 + (level - 1) * 0.10; // +10% per lvl
+int seatsForLevel(int level) => 4 + (level - 1) * 1;     // 4 → +1/lvl
+int queueCapacityForLevel(int level) => seatsForLevel(level) + 8;
+
 enum RidePhase {
   waitingForGuests,
   boarding,
@@ -341,9 +358,9 @@ class GameNotifier extends Notifier<GameState> {
     // Ride cycle progression
     final ride = state.ride;
     ride.phaseElapsed += Duration(milliseconds: dtMs);
-    final speedScale = _rideSpeedScale(d);
+    final cycleScale = _rideSpeedScale(d) * speedScale(d.speedLevel);
     final scaled = Duration(
-      milliseconds: (ride.phaseDuration.inMilliseconds / speedScale).ceil(),
+      milliseconds: (ride.phaseDuration.inMilliseconds / cycleScale).ceil(),
     );
     if (ride.phaseElapsed >= scaled) {
       _advanceRide(ride, d, floats);
@@ -397,6 +414,8 @@ class GameNotifier extends Notifier<GameState> {
     final next = _nextPhase(ride.phase);
     ride.phase = next;
     ride.phaseElapsed = Duration.zero;
+    final seats = seatsForLevel(d.carsLevel);
+    final qCap = queueCapacityForLevel(d.carsLevel);
     switch (next) {
       case RidePhase.waitingForGuests:
         ride.phaseDuration = const Duration(milliseconds: 1500);
@@ -405,11 +424,11 @@ class GameNotifier extends Notifier<GameState> {
         break;
       case RidePhase.boarding:
         ride.phaseDuration = const Duration(milliseconds: 1500);
-        ride.queueCount = 4 + _rng.nextInt(5);
+        ride.queueCount = qCap;
         break;
       case RidePhase.seating:
         ride.phaseDuration = const Duration(milliseconds: 1000);
-        ride.seatedCount = ride.queueCount;
+        ride.seatedCount = math.min(seats, ride.queueCount);
         break;
       case RidePhase.safetyBar:
         ride.phaseDuration = const Duration(milliseconds: 1000);
@@ -425,15 +444,27 @@ class GameNotifier extends Notifier<GameState> {
         break;
       case RidePhase.unboarding:
         ride.phaseDuration = const Duration(milliseconds: 1500);
-        // Settle ride bonus: small flat tip on top of CPS to give visible coin pop
-        final tip = state.cps * 4 + 10;
-        d.coin += tip;
-        d.totalCoinEarned += tip;
+        // Settlement: per-seat ticket price plus small CPS-based tip.
+        final perSeat = _ticketPricePerSeat(d);
+        final ridersTip = ride.seatedCount * perSeat;
+        final cpsTip = state.cps * 4 + 10;
+        final total = ridersTip + cpsTip;
+        d.coin += total;
+        d.totalCoinEarned += total;
         ride.rideCount += 1;
         d.stats.totalRides += 1;
         _bumpMission(d, MissionMetric.ride, 1);
         break;
     }
+  }
+
+  /// Per-seat ride price. Scales with ticket level + tap power (so the
+  /// production-side investments also lift ride income).
+  double _ticketPricePerSeat(SaveData d) {
+    final base = ticketTapBonus(d.ticketLevel);
+    final overall = prestigeOverallMultiplier(d);
+    final sets = _setBonuses(d).tap;
+    return base * overall * sets * 4;
   }
 
   RidePhase _nextPhase(RidePhase p) {
@@ -538,7 +569,7 @@ class GameNotifier extends Notifier<GameState> {
   }
 
   double _computeTapPower(SaveData d) {
-    var base = 1.0;
+    var base = ticketTapBonus(d.ticketLevel);
     for (final t in tapUpgradeCatalog) {
       final lv = d.tapUpgradeLevels[t.id] ?? 0;
       base += t.tapPowerPerLevel * lv;
@@ -749,6 +780,65 @@ class GameNotifier extends Notifier<GameState> {
     return true;
   }
 
+  // Headline upgrades (Ticket / Speed / Cars).
+  // `count == 0` means "buy max affordable", capped at 100 per tap to
+  // keep the loop responsive.
+  int buyTicket({int count = 1}) => _buyHeadline(
+        currentLevel: () => state.data.ticketLevel,
+        setLevel: (lv) => state.data.ticketLevel = lv,
+        cost: ticketCost,
+        maxLevel: ticketMaxLevelInfinite,
+        count: count,
+      );
+
+  int buySpeed({int count = 1}) => _buyHeadline(
+        currentLevel: () => state.data.speedLevel,
+        setLevel: (lv) => state.data.speedLevel = lv,
+        cost: speedCost,
+        maxLevel: speedMaxLevel,
+        count: count,
+      );
+
+  int buyCars({int count = 1}) => _buyHeadline(
+        currentLevel: () => state.data.carsLevel,
+        setLevel: (lv) => state.data.carsLevel = lv,
+        cost: carsCost,
+        maxLevel: carsMaxLevel,
+        count: count,
+      );
+
+  int _buyHeadline({
+    required int Function() currentLevel,
+    required void Function(int) setLevel,
+    required double Function(int) cost,
+    required int maxLevel,
+    required int count,
+  }) {
+    final d = state.data;
+    var purchased = 0;
+    final hardCap = count <= 0 ? 100 : count;
+    for (var i = 0; i < hardCap; i++) {
+      final lv = currentLevel();
+      if (maxLevel != 0 && lv >= maxLevel) break;
+      final c = cost(lv + 1);
+      if (d.coin < c) break;
+      d.coin -= c;
+      _consumeUnconverted(d, c);
+      setLevel(lv + 1);
+      purchased += 1;
+      d.stats.totalUpgradesPurchased += 1;
+      _bumpMission(d, MissionMetric.upgradePurchase, 1);
+    }
+    if (purchased > 0) {
+      state = state.copyWith(
+        data: d,
+        cps: _computeCps(d),
+        tapPower: _computeTapPower(d),
+      );
+    }
+    return purchased;
+  }
+
   void _consumeUnconverted(SaveData d, double amount) {
     if (d.purchasedCoinUnconverted <= 0) return;
     d.purchasedCoinUnconverted =
@@ -904,6 +994,9 @@ class GameNotifier extends Notifier<GameState> {
     d.purchasedCoinUnconverted = 0;
     d.tapUpgradeLevels.clear();
     d.autoProducerLevels.clear();
+    d.ticketLevel = 1;
+    d.speedLevel = 1;
+    d.carsLevel = 1;
     d.currentCombo = 0;
     d.tapsSinceGoldenGuest = 0;
     state = state.copyWith(

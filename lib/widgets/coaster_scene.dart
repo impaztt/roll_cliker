@@ -3,10 +3,11 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../core/theme.dart';
 import '../providers/game_provider.dart';
 
-/// Animated 2.5D-ish roller-coaster scene rendered with CustomPainter.
+/// Top-down isometric (2.5D) diorama of the coaster park.
+/// Designed to fit the entire ride loop on a single screen so the player
+/// can watch it from a fixed pulled-back camera.
 class CoasterScene extends ConsumerStatefulWidget {
   const CoasterScene({super.key});
 
@@ -16,41 +17,41 @@ class CoasterScene extends ConsumerStatefulWidget {
 
 class _CoasterSceneState extends ConsumerState<CoasterScene>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _bg;
+  late final Ticker _ticker;
+  double _t = 0;
 
   @override
   void initState() {
     super.initState();
-    _bg = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 16),
-    )..repeat();
+    _ticker = Ticker((_) {
+      setState(() {
+        _t = DateTime.now().millisecondsSinceEpoch / 1000.0;
+      });
+    })..start();
   }
 
   @override
   void dispose() {
-    _bg.dispose();
+    _ticker.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final game = ref.watch(gameProvider);
-    return AnimatedBuilder(
-      animation: _bg,
-      builder: (_, __) {
-        return CustomPaint(
-          painter: _CoasterPainter(
-            phase: game.ride.phase,
-            phaseT: _phaseProgress(game.ride),
-            stage: game.coasterStage,
-            seated: game.ride.seatedCount,
-            queue: game.ride.queueCount,
-            time: DateTime.now().millisecondsSinceEpoch / 1000.0,
-          ),
-          child: const SizedBox.expand(),
-        );
-      },
+    return RepaintBoundary(
+      child: CustomPaint(
+        painter: _DioramaPainter(
+          phase: game.ride.phase,
+          phaseT: _phaseProgress(game.ride),
+          stage: game.coasterStage,
+          seated: game.ride.seatedCount,
+          queue: game.ride.queueCount,
+          carsLevel: game.data.carsLevel,
+          time: _t,
+        ),
+        child: const SizedBox.expand(),
+      ),
     );
   }
 
@@ -61,212 +62,498 @@ class _CoasterSceneState extends ConsumerState<CoasterScene>
   }
 }
 
-class _CoasterPainter extends CustomPainter {
+/// Lightweight Ticker that mimics SchedulerBinding's vsync without needing
+/// to import `package:flutter/scheduler.dart`.
+class Ticker {
+  final void Function(Duration) onTick;
+  bool _running = false;
+  Ticker(this.onTick);
+  void start() {
+    _running = true;
+    _loop();
+  }
+
+  Future<void> _loop() async {
+    while (_running) {
+      await Future<void>.delayed(const Duration(milliseconds: 33));
+      if (_running) onTick(Duration.zero);
+    }
+  }
+
+  void dispose() {
+    _running = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Painter
+// ─────────────────────────────────────────────────────────────────────
+
+class _DioramaPainter extends CustomPainter {
   final RidePhase phase;
   final double phaseT;
   final int stage;
   final int seated;
   final int queue;
+  final int carsLevel;
   final double time;
 
-  _CoasterPainter({
+  _DioramaPainter({
     required this.phase,
     required this.phaseT,
     required this.stage,
     required this.seated,
     required this.queue,
+    required this.carsLevel,
     required this.time,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    _drawSky(canvas, size);
-    _drawHills(canvas, size);
-    _drawTrack(canvas, size);
-    _drawStation(canvas, size);
-    _drawQueue(canvas, size);
-    _drawTrain(canvas, size);
-    _drawDecorations(canvas, size);
+    final palette = _PaletteForStage.forStage(stage);
+
+    _drawBackground(canvas, size, palette);
+
+    // Center the scene so that grid (0,0) sits in the middle horizontally
+    // and slightly above the bottom.
+    final cx = size.width / 2;
+    final cy = size.height * 0.46;
+    final scale = math.min(size.width / 11.0, size.height / 14.0);
+
+    final ctx = _SceneCtx(
+      canvas: canvas,
+      size: size,
+      cx: cx,
+      cy: cy,
+      scale: scale,
+      time: time,
+      palette: palette,
+    );
+
+    _drawGround(ctx);
+    _drawSurroundings(ctx);
+    _drawTrack(ctx);
+    _drawStation(ctx);
+    _drawQueue(ctx);
+    _drawTrain(ctx);
+    _drawSparkles(ctx);
   }
 
-  void _drawSky(Canvas canvas, Size size) {
-    final sky = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0xFFB3E5FC), Color(0xFFFFCCBC)],
-      ).createShader(Offset.zero & size);
-    canvas.drawRect(Offset.zero & size, sky);
+  // ── Coordinate helper ────────────────────────────────────────────────
+  // Convert world (x, y, z) to screen. y is depth, z is height.
+  Offset _world(_SceneCtx ctx, double x, double y, [double z = 0]) {
+    // Classic 2:1 isometric.
+    final sx = ctx.cx + (x - y) * ctx.scale * 0.86;
+    final sy = ctx.cy + (x + y) * ctx.scale * 0.5 - z * ctx.scale * 0.9;
+    return Offset(sx, sy);
+  }
 
-    // Slow clouds
-    final cloud = Paint()..color = Colors.white.withValues(alpha: 0.85);
-    final w = size.width;
-    final cloudY = size.height * 0.18;
-    for (var i = 0; i < 3; i++) {
-      final x =
-          (((time * 6 + i * w / 3) % (w + 100)) - 50);
-      _drawCloud(canvas, Offset(x, cloudY + i * 8), 26 + i * 4.0, cloud);
+  // ── Background sky/grass split ──────────────────────────────────────
+  void _drawBackground(Canvas canvas, Size size, _StagePalette palette) {
+    final rect = Offset.zero & size;
+    final skyShader = LinearGradient(
+      begin: Alignment.topCenter,
+      end: Alignment.bottomCenter,
+      colors: [palette.skyTop, palette.skyBot],
+    ).createShader(rect);
+    canvas.drawRect(rect, Paint()..shader = skyShader);
+  }
+
+  void _drawGround(_SceneCtx ctx) {
+    // Lawn rhombus
+    final corners = <Offset>[
+      _world(ctx, -5, -5),
+      _world(ctx, 5, -5),
+      _world(ctx, 5, 5),
+      _world(ctx, -5, 5),
+    ];
+    final path = Path()..addPolygon(corners, true);
+    final lawn = Paint()..color = ctx.palette.grass;
+    ctx.canvas.drawPath(path, lawn);
+
+    // Lawn highlight (lighter band)
+    final lawnHi = Paint()
+      ..color = Colors.white.withValues(alpha: 0.05)
+      ..style = PaintingStyle.fill;
+    final hiPath = Path()
+      ..addPolygon([
+        _world(ctx, -5, -5),
+        _world(ctx, 5, -5),
+        _world(ctx, 5, -2),
+        _world(ctx, -5, -2),
+      ], true);
+    ctx.canvas.drawPath(hiPath, lawnHi);
+
+    // Outer asphalt frame
+    final asphaltPaint = Paint()..color = const Color(0xFFCFD8DC);
+    final outer = <Offset>[
+      _world(ctx, -6.4, -6.4),
+      _world(ctx, 6.4, -6.4),
+      _world(ctx, 6.4, 6.4),
+      _world(ctx, -6.4, 6.4),
+    ];
+    final inner = <Offset>[
+      _world(ctx, -5, -5),
+      _world(ctx, 5, -5),
+      _world(ctx, 5, 5),
+      _world(ctx, -5, 5),
+    ];
+    final road = Path()
+      ..addPolygon(outer, true)
+      ..addPolygon(inner.reversed.toList(), true)
+      ..fillType = PathFillType.evenOdd;
+    ctx.canvas.drawPath(road, asphaltPaint);
+
+    // Crosswalk in the front
+    final cross = Paint()..color = Colors.white.withValues(alpha: 0.8);
+    for (var i = 0; i < 5; i++) {
+      final x0 = -1.4 + i * 0.6;
+      final p = Path()
+        ..addPolygon([
+          _world(ctx, x0, 5.1),
+          _world(ctx, x0 + 0.4, 5.1),
+          _world(ctx, x0 + 0.4, 6.2),
+          _world(ctx, x0, 6.2),
+        ], true);
+      ctx.canvas.drawPath(p, cross);
     }
   }
 
-  void _drawCloud(Canvas canvas, Offset c, double r, Paint p) {
-    canvas.drawCircle(c, r, p);
-    canvas.drawCircle(c.translate(r * 0.7, 4), r * 0.8, p);
-    canvas.drawCircle(c.translate(-r * 0.7, 4), r * 0.8, p);
+  // ── Surroundings (cute dioramas around the lawn) ────────────────────
+  void _drawSurroundings(_SceneCtx ctx) {
+    // Left building (food shop)
+    _drawBox(ctx,
+        x: -6.0,
+        y: -4.5,
+        w: 1.6,
+        d: 1.6,
+        h: 1.6,
+        wall: const Color(0xFFFFF1D6),
+        roof: const Color(0xFFEF7F6F));
+    // Awning stripes
+    final awnRect = <Offset>[
+      _world(ctx, -6.0, -4.5, 0.7),
+      _world(ctx, -4.4, -4.5, 0.7),
+      _world(ctx, -4.4, -4.5, 0.95),
+      _world(ctx, -6.0, -4.5, 0.95),
+    ];
+    ctx.canvas.drawPath(
+      Path()..addPolygon(awnRect, true),
+      Paint()..color = const Color(0xFFFF6F60),
+    );
+
+    // Tree
+    _drawTree(ctx, -3.6, -5.6);
+    _drawTree(ctx, 4.5, -5.6);
+    _drawTree(ctx, -5.5, 4.0);
+    _drawTree(ctx, 5.4, 3.4);
+
+    // Right pavilion (balloon stand)
+    _drawBox(ctx,
+        x: 4.4,
+        y: -4.4,
+        w: 1.4,
+        d: 1.4,
+        h: 1.0,
+        wall: const Color(0xFFB3E5FC),
+        roof: const Color(0xFF4FC3F7));
+    _drawBalloon(ctx, x: 4.0, y: -4.4, color: const Color(0xFFEF9A9A));
+    _drawBalloon(ctx, x: 5.6, y: -4.4, color: const Color(0xFFFFD54F));
+    _drawBalloon(ctx, x: 4.8, y: -3.4, color: const Color(0xFF80CBC4));
+
+    // Food truck (front-right)
+    _drawBox(ctx,
+        x: 4.2,
+        y: 3.2,
+        w: 1.6,
+        d: 0.9,
+        h: 0.9,
+        wall: const Color(0xFFFFE082),
+        roof: const Color(0xFFEF5350));
+    // wheels
+    final wheelP = Paint()..color = const Color(0xFF263238);
+    ctx.canvas.drawCircle(_world(ctx, 4.4, 3.6, 0), 4, wheelP);
+    ctx.canvas.drawCircle(_world(ctx, 5.6, 3.6, 0), 4, wheelP);
+
+    // Gate poles
+    _drawPole(ctx, -4.5, 5.0, ctx.palette.poleColor);
+    _drawPole(ctx, 4.5, 5.0, ctx.palette.poleColor);
   }
 
-  void _drawHills(Canvas canvas, Size size) {
-    final hill = Paint()..color = const Color(0xFFC5E1A5);
-    final hill2 = Paint()..color = const Color(0xFFAED581);
-    final path1 = Path()
-      ..moveTo(0, size.height * 0.55)
-      ..quadraticBezierTo(
-        size.width * 0.3,
-        size.height * 0.35,
-        size.width * 0.5,
-        size.height * 0.5,
-      )
-      ..quadraticBezierTo(
-        size.width * 0.75,
-        size.height * 0.65,
-        size.width,
-        size.height * 0.45,
-      )
-      ..lineTo(size.width, size.height)
-      ..lineTo(0, size.height)
-      ..close();
-    canvas.drawPath(path1, hill);
-
-    final path2 = Path()
-      ..moveTo(0, size.height * 0.7)
-      ..quadraticBezierTo(
-        size.width * 0.25,
-        size.height * 0.55,
-        size.width * 0.5,
-        size.height * 0.7,
-      )
-      ..quadraticBezierTo(
-        size.width * 0.8,
-        size.height * 0.85,
-        size.width,
-        size.height * 0.7,
-      )
-      ..lineTo(size.width, size.height)
-      ..lineTo(0, size.height)
-      ..close();
-    canvas.drawPath(path2, hill2);
-  }
-
-  void _drawTrack(Canvas canvas, Size size) {
-    // Big arc-shaped track
-    final railColor = stage >= 6 ? const Color(0xFFEC407A) : AppColors.railWood;
-    final pillarColor = const Color(0xFF8D6E63);
-
-    final pillar = Paint()..color = pillarColor;
-    for (var i = 1; i < 5; i++) {
-      final x = size.width * (i / 5);
-      final yTop = _trackY(x / size.width) * size.height;
-      canvas.drawRect(
-        Rect.fromLTWH(x - 4, yTop, 8, size.height - yTop - 80),
-        pillar,
+  void _drawTree(_SceneCtx ctx, double x, double y) {
+    // Trunk
+    final trunkTop = _world(ctx, x, y, 0.5);
+    final trunkBot = _world(ctx, x, y, 0);
+    ctx.canvas.drawLine(
+      trunkBot,
+      trunkTop,
+      Paint()
+        ..color = const Color(0xFF8D6E63)
+        ..strokeWidth = 4,
+    );
+    // Foliage (3 stacked discs for low-poly tree)
+    void disc(double z, double r, Color c) {
+      ctx.canvas.drawOval(
+        Rect.fromCenter(
+            center: _world(ctx, x, y, z), width: r * 2, height: r * 1.2),
+        Paint()..color = c,
       );
     }
 
-    final rail = Paint()
-      ..color = railColor
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 6
-      ..strokeCap = StrokeCap.round;
+    disc(0.6, 12, const Color(0xFF66BB6A));
+    disc(0.85, 10, const Color(0xFF81C784));
+    disc(1.05, 7, const Color(0xFFA5D6A7));
+  }
 
-    final path = Path();
-    final steps = 60;
-    for (var i = 0; i <= steps; i++) {
-      final t = i / steps;
-      final x = size.width * t;
-      final y = _trackY(t) * size.height;
-      if (i == 0) {
-        path.moveTo(x, y);
-      } else {
-        path.lineTo(x, y);
+  void _drawBalloon(_SceneCtx ctx, {required double x, required double y, required Color color}) {
+    final base = _world(ctx, x, y, 0);
+    final body = _world(ctx, x, y, 1.4);
+    ctx.canvas.drawLine(
+      base,
+      body,
+      Paint()
+        ..color = Colors.black.withValues(alpha: 0.2)
+        ..strokeWidth = 1,
+    );
+    ctx.canvas.drawCircle(body, 8, Paint()..color = color);
+    ctx.canvas.drawCircle(
+      body.translate(-2, -2),
+      2,
+      Paint()..color = Colors.white.withValues(alpha: 0.6),
+    );
+  }
+
+  void _drawPole(_SceneCtx ctx, double x, double y, Color color) {
+    final base = _world(ctx, x, y, 0);
+    final top = _world(ctx, x, y, 1.2);
+    ctx.canvas.drawLine(
+      base,
+      top,
+      Paint()
+        ..color = color
+        ..strokeWidth = 3,
+    );
+    ctx.canvas.drawCircle(top, 4, Paint()..color = const Color(0xFFFFCA28));
+  }
+
+  /// Draws an isometric box (cuboid) by painting top + two visible faces.
+  void _drawBox(
+    _SceneCtx ctx, {
+    required double x,
+    required double y,
+    required double w,
+    required double d,
+    required double h,
+    required Color wall,
+    required Color roof,
+  }) {
+    // 8 corners (top-of-floor `bXX` and roof `tXX`).
+    final btr = _world(ctx, x + w, y, 0);
+    final bbr = _world(ctx, x + w, y + d, 0);
+    final bbl = _world(ctx, x, y + d, 0);
+    final ttl = _world(ctx, x, y, h);
+    final ttr = _world(ctx, x + w, y, h);
+    final tbr = _world(ctx, x + w, y + d, h);
+    final tbl = _world(ctx, x, y + d, h);
+
+    // Right wall (lighter)
+    final rightFace = Path()..addPolygon([btr, bbr, tbr, ttr], true);
+    ctx.canvas.drawPath(rightFace, Paint()..color = _shade(wall, -0.05));
+
+    // Front wall (darker)
+    final frontFace = Path()..addPolygon([bbl, bbr, tbr, tbl], true);
+    ctx.canvas.drawPath(frontFace, Paint()..color = _shade(wall, -0.18));
+
+    // Roof / top
+    final top = Path()..addPolygon([ttl, ttr, tbr, tbl], true);
+    ctx.canvas.drawPath(top, Paint()..color = roof);
+
+    // Door
+    final doorW = w * 0.25;
+    final doorH = h * 0.55;
+    final dxl = x + w * 0.5 - doorW / 2;
+    final dxr = dxl + doorW;
+    final door = Path()
+      ..addPolygon([
+        _world(ctx, dxl, y + d, 0),
+        _world(ctx, dxr, y + d, 0),
+        _world(ctx, dxr, y + d, doorH),
+        _world(ctx, dxl, y + d, doorH),
+      ], true);
+    ctx.canvas.drawPath(door, Paint()..color = const Color(0xFF6D4C41));
+  }
+
+  // ── Track loop ──────────────────────────────────────────────────────
+  // The ride uses a closed loop sampled into points. We keep this
+  // outside the painter as a static so all calls share the same shape.
+  static const int _trackSamples = 220;
+  static List<_Vec3>? _trackPoints;
+
+  static List<_Vec3> _track() {
+    if (_trackPoints != null) return _trackPoints!;
+    final pts = <_Vec3>[];
+    for (var i = 0; i < _trackSamples; i++) {
+      final t = i / _trackSamples;
+      final a = t * math.pi * 2;
+      // Figure-eight-ish loop with a bump in the middle.
+      final r1 = 3.0;
+      final r2 = 2.2;
+      final x = r1 * math.sin(a);
+      final y = r2 * math.sin(a * 2) * 0.7 - 1.0; // center the loop slightly back
+      // Height undulation creates the "hill + dip" feel.
+      final z = 0.55 + 0.45 * (math.sin(a * 2 + 0.6) * 0.5 + 0.5);
+      pts.add(_Vec3(x, y, z));
+    }
+    _trackPoints = pts;
+    return pts;
+  }
+
+  void _drawTrack(_SceneCtx ctx) {
+    final pts = _track();
+    final railColor = ctx.palette.railColor;
+    final beamColor = ctx.palette.beamColor;
+
+    // Pillars at regular intervals.
+    for (var i = 0; i < pts.length; i += 14) {
+      final p = pts[i];
+      final base = _world(ctx, p.x, p.y, 0);
+      final top = _world(ctx, p.x, p.y, p.z);
+      ctx.canvas.drawLine(
+        base,
+        top,
+        Paint()
+          ..color = beamColor
+          ..strokeWidth = 4,
+      );
+    }
+
+    // Two parallel rails (separated horizontally in screen-space).
+    Path railPath(double offset) {
+      final p = Path();
+      for (var i = 0; i <= pts.length; i++) {
+        final v = pts[i % pts.length];
+        final s = _world(ctx, v.x, v.y, v.z);
+        final s2 = s.translate(offset, 0);
+        if (i == 0) {
+          p.moveTo(s2.dx, s2.dy);
+        } else {
+          p.lineTo(s2.dx, s2.dy);
+        }
+      }
+      return p;
+    }
+
+    final railPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round
+      ..color = railColor;
+    ctx.canvas.drawPath(railPath(-3), railPaint);
+    ctx.canvas.drawPath(railPath(3), railPaint);
+
+    // Cross ties (rungs).
+    final tiePaint = Paint()
+      ..color = beamColor
+      ..strokeWidth = 2;
+    for (var i = 0; i < pts.length; i += 4) {
+      final v = pts[i];
+      final s = _world(ctx, v.x, v.y, v.z);
+      ctx.canvas.drawLine(
+        s.translate(-3, 0),
+        s.translate(3, 0),
+        tiePaint,
+      );
+    }
+  }
+
+  // ── Station ─────────────────────────────────────────────────────────
+  void _drawStation(_SceneCtx ctx) {
+    // Big station box with a checkered roof, sitting at the front of
+    // the loop so it's clearly visible.
+    final wall = const Color(0xFFB3E5FC);
+    _drawBox(ctx,
+        x: -2.0,
+        y: 1.4,
+        w: 4.0,
+        d: 1.6,
+        h: 1.4,
+        wall: wall,
+        roof: const Color(0xFF4FC3F7));
+    // Roof checker pattern (lighter rectangles)
+    final t = const Color(0xFFE1F5FE);
+    for (var i = 0; i < 3; i++) {
+      for (var j = 0; j < 2; j++) {
+        if ((i + j) % 2 != 0) continue;
+        final x0 = -2.0 + 0.3 + i * 1.2;
+        final y0 = 1.4 + 0.3 + j * 0.65;
+        final p = Path()
+          ..addPolygon([
+            _world(ctx, x0, y0, 1.42),
+            _world(ctx, x0 + 1.0, y0, 1.42),
+            _world(ctx, x0 + 1.0, y0 + 0.5, 1.42),
+            _world(ctx, x0, y0 + 0.5, 1.42),
+          ], true);
+        ctx.canvas.drawPath(p, Paint()..color = t);
       }
     }
-    canvas.drawPath(path, rail);
 
-    // Cross ties (rungs)
-    final tie = Paint()
-      ..color = railColor.withValues(alpha: 0.6)
-      ..strokeWidth = 3;
-    for (var i = 1; i < steps; i += 3) {
-      final t = i / steps;
-      final x = size.width * t;
-      final y = _trackY(t) * size.height;
-      canvas.drawLine(Offset(x, y), Offset(x, y + 10), tie);
-    }
+    // Counter signage on the front of the station.
+    final seats = seatsForLevel(carsLevel);
+    final qCap = queueCapacityForLevel(carsLevel);
+    _drawSignBoard(ctx, x: -1.7, y: 3.0, label: '$seated/$seats',
+        color: const Color(0xFF2196F3));
+    _drawSignBoard(ctx, x: 0.8, y: 3.0, label: '$queue/$qCap',
+        color: const Color(0xFF9C27B0));
+
+    // Conductor
+    _drawCharacter(ctx, x: 1.7, y: 1.6,
+        shirt: const Color(0xFFE53935),
+        pants: const Color(0xFF1565C0),
+        skin: const Color(0xFFFFCC80),
+        wave: math.sin(time * 4) * 4);
   }
 
-  double _trackY(double t) {
-    // Sinusoidal track that creates a fun coaster-like curve.
-    final base = 0.55;
-    final amp = 0.18;
-    return base - amp * math.sin(t * math.pi * 1.3);
-  }
-
-  void _drawStation(Canvas canvas, Size size) {
-    final stX = size.width * 0.05;
-    final stY = _trackY(0.0) * size.height - 28;
-    final stW = size.width * 0.18;
-    final stH = 60.0;
-
-    final roof = Paint()..color = const Color(0xFFFF8A65);
-    final wall = Paint()..color = const Color(0xFFFFE0B2);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(stX, stY + 14, stW, stH),
-        const Radius.circular(8),
+  void _drawSignBoard(
+    _SceneCtx ctx, {
+    required double x,
+    required double y,
+    required String label,
+    required Color color,
+  }) {
+    final bottom = _world(ctx, x, y, 0);
+    final top = _world(ctx, x, y, 0.85);
+    ctx.canvas.drawLine(
+      bottom,
+      top,
+      Paint()
+        ..color = const Color(0xFF455A64)
+        ..strokeWidth = 2,
+    );
+    final boardCenter = _world(ctx, x, y, 1.05);
+    final rect = Rect.fromCenter(center: boardCenter, width: 50, height: 30);
+    final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(6));
+    ctx.canvas.drawRRect(rrect, Paint()..color = color);
+    final tp = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.w800,
+          fontSize: 13,
+        ),
       ),
-      wall,
-    );
-    final roofPath = Path()
-      ..moveTo(stX - 6, stY + 18)
-      ..lineTo(stX + stW / 2, stY - 2)
-      ..lineTo(stX + stW + 6, stY + 18)
-      ..close();
-    canvas.drawPath(roofPath, roof);
-
-    final flag = Paint()..color = const Color(0xFFFFD54F);
-    canvas.drawRect(
-      Rect.fromLTWH(stX + stW / 2 - 1, stY - 18, 2, 18),
-      Paint()..color = Colors.brown,
-    );
-    canvas.drawPath(
-      Path()
-        ..moveTo(stX + stW / 2, stY - 18)
-        ..lineTo(stX + stW / 2 + 12, stY - 14)
-        ..lineTo(stX + stW / 2, stY - 10)
-        ..close(),
-      flag,
-    );
-
-    // Conductor stick figure waving
-    final conductor = stX + stW + 6;
-    final pY = stY + stH - 18;
-    final tone = Paint()..color = const Color(0xFFFFCC80);
-    canvas.drawCircle(Offset(conductor, pY), 4, tone);
-    canvas.drawLine(Offset(conductor, pY + 4),
-        Offset(conductor, pY + 12), Paint()..color = const Color(0xFF6D4C41)..strokeWidth = 2);
-    final waveAmp = math.sin(time * 4) * 4;
-    canvas.drawLine(
-      Offset(conductor, pY + 6),
-      Offset(conductor + 6, pY + 2 + waveAmp),
-      Paint()..color = const Color(0xFFFFCC80)..strokeWidth = 2,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(
+      ctx.canvas,
+      rect.center.translate(-tp.width / 2, -tp.height / 2),
     );
   }
 
-  void _drawQueue(Canvas canvas, Size size) {
+  // ── Queue ───────────────────────────────────────────────────────────
+  void _drawQueue(_SceneCtx ctx) {
     if (queue == 0 && phase == RidePhase.waitingForGuests) return;
-    final stX = size.width * 0.05;
-    final stY = _trackY(0.0) * size.height + 50;
-    final colors = [
+    final palette = <Color>[
       const Color(0xFFEF9A9A),
       const Color(0xFF80CBC4),
       const Color(0xFFFFCC80),
@@ -276,83 +563,120 @@ class _CoasterPainter extends CustomPainter {
       const Color(0xFFFFAB91),
       const Color(0xFFB39DDB),
     ];
-    final n = queue.clamp(0, 8);
+    final pants = const Color(0xFF455A64);
+    final n = queue.clamp(0, 14);
     for (var i = 0; i < n; i++) {
-      final cx = stX + 10 + i * 9.0;
-      final bob = math.sin(time * 4 + i) * 1.2;
-      final c = colors[i % colors.length];
-      canvas.drawCircle(Offset(cx, stY + bob), 4, Paint()..color = c);
-      canvas.drawRect(
-        Rect.fromLTWH(cx - 3, stY + 4 + bob, 6, 8),
-        Paint()..color = c,
-      );
+      // Guests stretch from the crosswalk back to the station entrance.
+      final progress = i / (n - 1).clamp(1, 999);
+      final y = 5.4 - progress * 2.0;
+      final x = -2.6 + (i % 2 == 0 ? -0.2 : 0.2);
+      final shirt = palette[i % palette.length];
+      _drawCharacter(ctx,
+          x: x,
+          y: y,
+          shirt: shirt,
+          pants: pants,
+          skin: const Color(0xFFFFCC80),
+          wave: 0,
+          bob: math.sin(time * 4 + i) * 0.6);
     }
   }
 
-  void _drawTrain(Canvas canvas, Size size) {
-    final t = _trainPosition();
-    final x = size.width * t;
-    final y = _trackY(t) * size.height - 14;
-
-    // Train body
-    final bodyColor = _trainColor();
-    final body = Paint()..color = bodyColor;
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(x - 22, y - 12, 44, 20),
-        const Radius.circular(8),
-      ),
-      body,
-    );
-    // Windows
-    final win = Paint()..color = const Color(0xFFFFFDE7);
-    final showSeats = phase != RidePhase.waitingForGuests;
-    final personPaint = Paint()..color = const Color(0xFFFFCC80);
-    for (var i = 0; i < 3; i++) {
-      final wx = x - 18 + i * 14.0;
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(
-          Rect.fromLTWH(wx, y - 9, 10, 10),
-          const Radius.circular(3),
-        ),
-        win,
-      );
-      if (showSeats && seated > i) {
-        canvas.drawCircle(Offset(wx + 5, y - 4), 3, personPaint);
-      }
+  // ── Train ───────────────────────────────────────────────────────────
+  /// Returns 0..1 position around the track loop based on ride phase.
+  double _trainTrackT() {
+    switch (phase) {
+      case RidePhase.waitingForGuests:
+      case RidePhase.boarding:
+      case RidePhase.seating:
+      case RidePhase.safetyBar:
+        return 0.0;
+      case RidePhase.ready:
+        return 0.02 * phaseT;
+      case RidePhase.riding:
+        return 0.02 + 0.96 * phaseT;
+      case RidePhase.arriving:
+        return 0.98 + 0.02 * phaseT;
+      case RidePhase.unboarding:
+        return 0.0;
     }
-    // Wheels
-    final wheel = Paint()..color = const Color(0xFF455A64);
-    canvas.drawCircle(Offset(x - 14, y + 10), 4, wheel);
-    canvas.drawCircle(Offset(x + 14, y + 10), 4, wheel);
-    // Front nose / safety bar indicator
-    if (phase == RidePhase.safetyBar ||
+  }
+
+  void _drawTrain(_SceneCtx ctx) {
+    final pts = _track();
+    final tT = _trainTrackT();
+    final cars = carsLevel.clamp(1, 8);
+    final spacing = 0.012;
+
+    // Draw multiple cars trailing behind the head.
+    for (var c = 0; c < cars; c++) {
+      final t = (tT - c * spacing + 1) % 1;
+      final i = (t * pts.length).floor() % pts.length;
+      final iNext = (i + 1) % pts.length;
+      final v = pts[i];
+      final v2 = pts[iNext];
+      final p = _world(ctx, v.x, v.y, v.z);
+      final p2 = _world(ctx, v2.x, v2.y, v2.z);
+      _drawCar(ctx, p, p2, c == 0);
+    }
+  }
+
+  void _drawCar(_SceneCtx ctx, Offset p, Offset pNext, bool head) {
+    final dir = pNext - p;
+    final ang = math.atan2(dir.dy, dir.dx);
+    ctx.canvas.save();
+    ctx.canvas.translate(p.dx, p.dy);
+    ctx.canvas.rotate(ang);
+
+    final body = _carColor();
+    final shadowP = Paint()..color = Colors.black.withValues(alpha: 0.18);
+    ctx.canvas.drawOval(
+      Rect.fromCenter(center: const Offset(0, 12), width: 28, height: 8),
+      shadowP,
+    );
+    final bodyRect = RRect.fromRectAndRadius(
+      Rect.fromCenter(center: const Offset(0, 0), width: 28, height: 16),
+      const Radius.circular(6),
+    );
+    ctx.canvas.drawRRect(bodyRect, Paint()..color = body);
+    // Car roof highlight
+    ctx.canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(center: const Offset(0, -3), width: 24, height: 6),
+        const Radius.circular(4),
+      ),
+      Paint()..color = Colors.white.withValues(alpha: 0.4),
+    );
+    // Two seated passengers if they're aboard
+    final showSeats = phase == RidePhase.safetyBar ||
         phase == RidePhase.ready ||
         phase == RidePhase.riding ||
-        phase == RidePhase.arriving) {
-      final bar = Paint()..color = const Color(0xFFEC407A)..strokeWidth = 2;
-      canvas.drawLine(
-        Offset(x - 18, y - 2),
-        Offset(x + 18, y - 2),
-        bar,
+        phase == RidePhase.arriving;
+    if (showSeats && seated > 0) {
+      final headPaint = Paint()..color = const Color(0xFFFFCC80);
+      ctx.canvas.drawCircle(const Offset(-6, -2), 3, headPaint);
+      ctx.canvas.drawCircle(const Offset(6, -2), 3, headPaint);
+      ctx.canvas.drawRect(
+        Rect.fromCenter(center: const Offset(-6, 2), width: 6, height: 5),
+        Paint()..color = const Color(0xFF42A5F5),
+      );
+      ctx.canvas.drawRect(
+        Rect.fromCenter(center: const Offset(6, 2), width: 6, height: 5),
+        Paint()..color = const Color(0xFFEF5350),
       );
     }
-    // Speed lines while riding
-    if (phase == RidePhase.riding) {
-      final line = Paint()
-        ..color = Colors.white.withValues(alpha: 0.7)
-        ..strokeWidth = 2;
-      for (var i = 0; i < 4; i++) {
-        canvas.drawLine(
-          Offset(x - 28 - i * 6, y - 4 + i * 2.0),
-          Offset(x - 18 - i * 6, y - 4 + i * 2.0),
-          line,
-        );
-      }
+    if (head) {
+      // headlight
+      ctx.canvas.drawCircle(
+        const Offset(14, 0),
+        2.5,
+        Paint()..color = const Color(0xFFFFD54F),
+      );
     }
+    ctx.canvas.restore();
   }
 
-  Color _trainColor() {
+  Color _carColor() {
     switch (stage) {
       case 0:
         return const Color(0xFFA1887F);
@@ -373,55 +697,203 @@ class _CoasterPainter extends CustomPainter {
       case 8:
         return const Color(0xFFFFD54F);
       default:
-        return const Color(0xFF8E24AA);
+        return const Color(0xFFAB47BC);
     }
   }
 
-  /// 0..1 position along the track per phase.
-  double _trainPosition() {
-    switch (phase) {
-      case RidePhase.waitingForGuests:
-      case RidePhase.boarding:
-      case RidePhase.seating:
-      case RidePhase.safetyBar:
-        return 0.10;
-      case RidePhase.ready:
-        return 0.10 + 0.04 * phaseT;
-      case RidePhase.riding:
-        return 0.14 + 0.78 * phaseT;
-      case RidePhase.arriving:
-        return 0.92 + 0.06 * phaseT;
-      case RidePhase.unboarding:
-        // Snap back to station for next cycle visually
-        return 0.10;
+  // ── Tiny humanoid character ─────────────────────────────────────────
+  void _drawCharacter(_SceneCtx ctx,
+      {required double x,
+      required double y,
+      required Color shirt,
+      required Color pants,
+      required Color skin,
+      double wave = 0,
+      double bob = 0}) {
+    final feet = _world(ctx, x, y, 0).translate(0, -bob);
+    final hip = _world(ctx, x, y, 0.30).translate(0, -bob);
+    final chest = _world(ctx, x, y, 0.55).translate(0, -bob);
+    final head = _world(ctx, x, y, 0.78).translate(0, -bob);
+
+    // Shadow
+    ctx.canvas.drawOval(
+      Rect.fromCenter(center: feet.translate(0, 2), width: 10, height: 4),
+      Paint()..color = Colors.black.withValues(alpha: 0.18),
+    );
+    // Pants
+    ctx.canvas.drawLine(
+      feet,
+      hip,
+      Paint()
+        ..color = pants
+        ..strokeWidth = 4
+        ..strokeCap = StrokeCap.round,
+    );
+    // Shirt body
+    ctx.canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+            center: Offset((hip.dx + chest.dx) / 2, (hip.dy + chest.dy) / 2),
+            width: 8,
+            height: 12),
+        const Radius.circular(3),
+      ),
+      Paint()..color = shirt,
+    );
+    // Arms
+    final armPaint = Paint()
+      ..color = shirt
+      ..strokeWidth = 2.6
+      ..strokeCap = StrokeCap.round;
+    ctx.canvas.drawLine(
+      chest.translate(-3, 0),
+      chest.translate(-5, 4),
+      armPaint,
+    );
+    ctx.canvas.drawLine(
+      chest.translate(3, 0),
+      chest.translate(5 + wave, 4 - wave),
+      armPaint,
+    );
+    // Head
+    ctx.canvas.drawCircle(head, 4, Paint()..color = skin);
+    // Hair (a small dark cap)
+    ctx.canvas.drawArc(
+      Rect.fromCenter(center: head.translate(0, -1), width: 8, height: 8),
+      math.pi,
+      math.pi,
+      true,
+      Paint()..color = const Color(0xFF6D4C41),
+    );
+  }
+
+  // ── Sparkles for high stages ────────────────────────────────────────
+  void _drawSparkles(_SceneCtx ctx) {
+    if (stage < 6) return;
+    final p = Paint()..color = const Color(0xFFFFCA28);
+    for (var i = 0; i < 6; i++) {
+      final a = i * math.pi / 3 + time * 0.6;
+      final r = 6 + 4 * math.sin(time * 3 + i);
+      final c = _world(ctx, 0, -2.5, 1.6);
+      ctx.canvas.drawCircle(
+        c.translate(math.cos(a) * 30, math.sin(a) * 14),
+        r * 0.4,
+        p,
+      );
     }
   }
 
-  void _drawDecorations(Canvas canvas, Size size) {
-    if (stage >= 6) {
-      // Fireworks at later stages
-      final c = Offset(size.width * 0.85, size.height * 0.22);
-      final paint = Paint()
-        ..color = const Color(0xFFFFCA28).withValues(alpha: 0.9)
-        ..strokeWidth = 2;
-      for (var i = 0; i < 8; i++) {
-        final a = i * math.pi / 4 + time * 0.5;
-        canvas.drawLine(
-          c,
-          c.translate(math.cos(a) * (8 + math.sin(time * 4) * 4),
-              math.sin(a) * (8 + math.sin(time * 4) * 4)),
-          paint,
-        );
-      }
-    }
+  static Color _shade(Color base, double pct) {
+    final hsl = HSLColor.fromColor(base);
+    final l = (hsl.lightness + pct).clamp(0.0, 1.0);
+    return hsl.withLightness(l).toColor();
   }
 
   @override
-  bool shouldRepaint(covariant _CoasterPainter old) =>
+  bool shouldRepaint(covariant _DioramaPainter old) =>
       old.phase != phase ||
       old.phaseT != phaseT ||
       old.stage != stage ||
       old.seated != seated ||
       old.queue != queue ||
+      old.carsLevel != carsLevel ||
       old.time != time;
+}
+
+class _SceneCtx {
+  final Canvas canvas;
+  final Size size;
+  final double cx;
+  final double cy;
+  final double scale;
+  final double time;
+  final _StagePalette palette;
+  _SceneCtx({
+    required this.canvas,
+    required this.size,
+    required this.cx,
+    required this.cy,
+    required this.scale,
+    required this.time,
+    required this.palette,
+  });
+}
+
+class _Vec3 {
+  final double x, y, z;
+  const _Vec3(this.x, this.y, this.z);
+}
+
+// ── Per-stage palette ──────────────────────────────────────────────────
+class _StagePalette {
+  final Color skyTop;
+  final Color skyBot;
+  final Color grass;
+  final Color railColor;
+  final Color beamColor;
+  final Color poleColor;
+  const _StagePalette({
+    required this.skyTop,
+    required this.skyBot,
+    required this.grass,
+    required this.railColor,
+    required this.beamColor,
+    required this.poleColor,
+  });
+}
+
+class _PaletteForStage {
+  static _StagePalette forStage(int stage) {
+    switch (stage) {
+      case 0:
+      case 1:
+        return const _StagePalette(
+          skyTop: Color(0xFFB3E5FC),
+          skyBot: Color(0xFFFFE0B2),
+          grass: Color(0xFFAED581),
+          railColor: Color(0xFFE57373),
+          beamColor: Color(0xFFA1887F),
+          poleColor: Color(0xFF8D6E63),
+        );
+      case 2:
+      case 3:
+        return const _StagePalette(
+          skyTop: Color(0xFFB2EBF2),
+          skyBot: Color(0xFFFFCCBC),
+          grass: Color(0xFF9CCC65),
+          railColor: Color(0xFFFFB74D),
+          beamColor: Color(0xFF8D6E63),
+          poleColor: Color(0xFF6D4C41),
+        );
+      case 4:
+      case 5:
+        return const _StagePalette(
+          skyTop: Color(0xFF81D4FA),
+          skyBot: Color(0xFFF8BBD0),
+          grass: Color(0xFFAED581),
+          railColor: Color(0xFFBA68C8),
+          beamColor: Color(0xFF7986CB),
+          poleColor: Color(0xFF5C6BC0),
+        );
+      case 6:
+      case 7:
+        return const _StagePalette(
+          skyTop: Color(0xFF7E57C2),
+          skyBot: Color(0xFFEC407A),
+          grass: Color(0xFF9575CD),
+          railColor: Color(0xFFFFCA28),
+          beamColor: Color(0xFFAB47BC),
+          poleColor: Color(0xFF7E57C2),
+        );
+      default:
+        return const _StagePalette(
+          skyTop: Color(0xFF1A237E),
+          skyBot: Color(0xFFFF5252),
+          grass: Color(0xFF7B1FA2),
+          railColor: Color(0xFF40C4FF),
+          beamColor: Color(0xFFFFD740),
+          poleColor: Color(0xFFFFD740),
+        );
+    }
+  }
 }
